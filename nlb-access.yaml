@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: NLB Proxy for Endpoint.
+Parameters:
+  DomainName:
+    Type: String
+  TargetGroupARN:
+    Type: String
+  TargetGroupPort:
+    Type: Number
+Resources:
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn:
+          Fn::GetAtt:
+          - UpdateAddress
+          - Arn
+        RoleArn:
+          Fn::GetAtt:
+          - ScheduleToUpdateAddressRole
+          - Arn
+  UpdateAddress:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description:
+        Fn::Sub:
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: UpdateAddress
+      InlineCode: |
+        import json
+        import os
+        import time
+        import socket
+        import boto3
+
+        domainName = os.getenv('DOMAIN_NAME')
+        tableName = os.getenv('TABLE_NAME')
+
+
+        def handler(event, context):
+            # get all dns ip address from a domain name
+            addresses = []
+            infos = socket.getaddrinfo(
+                domainName, None, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, flags=0)
+            for info in infos:
+                addresses.append(info[4][0])
+            # sort array
+            addresses.sort()
+            # remove duplicate
+            addresses = list(set(addresses))
+            # get timestamp
+            now = int(time.time())
+
+            # get domain, addresses and timestamp from dynamodb
+            dynamodb = boto3.resource('dynamodb')
+            table = dynamodb.Table(tableName)
+            response = table.get_item(Key={'Domain': domainName})
+
+            if 'Item' in response and 'Timestamp' in response['Item'] and response['Item']['Timestamp'] > now:
+                return {}
+
+            if 'Item' not in response or response['Item']['Address'] != json.dumps(addresses):
+                # write domain, addresses and timestamp to dynamodb
+                item = {
+                    'Domain': domainName,
+                    'Address': json.dumps(addresses),
+                    'Timestamp': now
+                }
+                table.put_item(Item=item)
+
+            return {}
+      Handler: handler.handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 180
+      Tracing: Active
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: DomainInfo
+          DOMAIN_NAME:
+            Ref: DomainName
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: DomainInfo
+  UpdateAddressLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${UpdateAddress}
+  ScheduleToUpdateAddressRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              Fn::Sub: scheduler.${AWS::URLSuffix}
+          Action: sts:AssumeRole
+          Condition:
+            ArnLike:
+              aws:SourceArn:
+                Fn::Sub:
+                - arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/*/${AWS::StackName}-${ResourceId}-*
+                - ResourceId: Schedule
+      Policies:
+      - PolicyName: StartExecutionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              Fn::GetAtt:
+              - UpdateAddress
+              - Arn
+  UpdateTargetGroup:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description:
+        Fn::Sub:
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: UpdateTargetGroup
+      InlineCode: |
+        import json
+        import os
+        import boto3
+
+        targetGroupARN = os.getenv('TARGETGROUP_ARN')
+        targetGroupPort = os.getenv('TARGETGROUP_PORT')
+
+
+        def handler(event, context):
+            # Log the event argument for debugging and for use in local development.
+            print(json.dumps(event))
+
+            for event in event['Records']:
+                if event['eventName'] != 'INSERT' and event['eventName'] != 'MODIFY':
+                    continue
+                addresses = json.loads(event['dynamodb']['NewImage']['Address']['S'])
+
+                # Target group client
+                targetGroup = boto3.client('elbv2')
+                # Get targets from target group
+                targets = targetGroup.describe_target_health(
+                    TargetGroupArn=targetGroupARN)
+                if 'TargetHealthDescriptions' in targets:
+                    for target in targets['TargetHealthDescriptions']:
+                        if target['Target']['Id'] in addresses and target['Target']['Port'] == int(targetGroupPort):
+                            # Remove item from adresses
+                            print(target['Target']['Id'], 'remove from addresses list')
+                            addresses.remove(target['Target']['Id'])
+                            continue
+                        if target['Target']['Id'] not in addresses and target['Target']['Port'] == int(targetGroupPort):
+                            # Remove target from target group
+                            print(target['Target']['Id'], 'remove from target group')
+                            targetGroup.deregister_targets(TargetGroupArn=targetGroupARN,  Targets=[
+                                                          {'Id': target['Target']['Id'], 'Port': int(targetGroupPort)}])
+                    # add address to target group
+                    for address in addresses:
+                        print(address, 'add to target group')
+                        targetGroup.register_targets(TargetGroupArn=targetGroupARN,  Targets=[
+                            {'Id': address, 'Port': int(targetGroupPort)}])
+            return {}
+      Handler: handler.handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 180
+      Tracing: Active
+      Environment:
+        Variables:
+          TARGETGROUP_ARN:
+            Ref: TargetGroupARN
+          TARGETGROUP_PORT:
+            Ref: TargetGroupPort
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - elasticloadbalancing:RegisterTargets
+          - elasticloadbalancing:DeregisterTargets
+          Resource:
+            Ref: TargetGroupARN
+        - Effect: Allow
+          Action:
+          - elasticloadbalancing:DescribeTargetHealth
+          Resource: '*'
+      Events:
+        DomainInfo:
+          Type: DynamoDB
+          Properties:
+            Stream:
+              Fn::GetAtt:
+              - DomainInfo
+              - StreamArn
+            StartingPosition: LATEST
+            BatchSize: 1
+  UpdateTargetGroupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${UpdateTargetGroup}
+  DomainInfo:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: Domain
+        AttributeType: S
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 3
+        WriteCapacityUnits: 3
+      KeySchema:
+      - AttributeName: Domain
+        KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES

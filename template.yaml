@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: NLB Proxy for Endpoint.
+Parameters:
+  DomainName:
+    Type: String
+  TargetGroupARN:
+    Type: String
+  TargetGroupPort:
+    Type: Number
+Resources:
+  Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt UpdateAddress.Arn
+        RoleArn: !GetAtt ScheduleToUpdateAddressRole.Arn
+  UpdateAddress:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: !Sub
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: UpdateAddress
+      CodeUri: src/UpdateAddress
+      Handler: handler.handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 180
+      Tracing: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DomainInfo
+          DOMAIN_NAME: !Ref DomainName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DomainInfo
+  UpdateAddressLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${UpdateAddress}
+  ScheduleToUpdateAddressRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: !Sub scheduler.${AWS::URLSuffix}
+          Action: sts:AssumeRole
+          Condition:
+            ArnLike:
+              aws:SourceArn: !Sub
+                - arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/*/${AWS::StackName}-${ResourceId}-*
+                - ResourceId: Schedule
+      Policies:
+        - PolicyName: StartExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt UpdateAddress.Arn
+  UpdateTargetGroup:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: !Sub
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: UpdateTargetGroup
+      CodeUri: src/UpdateTargetGroup
+      Handler: handler.handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 180
+      Tracing: Active
+      Environment:
+        Variables:
+          TARGETGROUP_ARN: !Ref TargetGroupARN
+          TARGETGROUP_PORT: !Ref TargetGroupPort
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - elasticloadbalancing:RegisterTargets
+                - elasticloadbalancing:DeregisterTargets
+              Resource: !Ref TargetGroupARN
+            - Effect: Allow
+              Action:
+                - elasticloadbalancing:DescribeTargetHealth
+              Resource: '*'
+      Events:
+        DomainInfo:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt DomainInfo.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 1
+  UpdateTargetGroupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${UpdateTargetGroup}
+  DomainInfo:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: Domain
+          AttributeType: S
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 3
+        WriteCapacityUnits: 3
+      KeySchema:
+        - AttributeName: Domain
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
