@@ -4,4 +4,4 @@
 test.md
 out.yaml
 ddb-event.json
-env.json
+env.json.DS_Store
