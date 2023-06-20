@@ -22,7 +22,7 @@ region = 'sa-east-1'  # e.g. us-west-1
 service = 'es'
 credentials = boto3.Session().get_credentials()
 awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service, session_token=credentials.token)
-host = 'https://search-opensearch-demo-sms6ryhe5mz6zsh42qva6zdtey.sa-east-1.es.amazonaws.com'
+host = 'https://your-OpenSearch-domain.sa-east-1.es.amazonaws.com'
 datatype = '_doc'
 headers = {"Content-Type": "application/json"}
 s3 = boto3.client('s3')
